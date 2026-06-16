@@ -806,11 +806,13 @@ impl CliSession {
         let current_model_name = current_model_config.model_name.clone();
 
         if model.is_none() {
-            output::goose_mode_message(&format!(
-                "Current session model: '{}' (provider '{}')",
-                current_model_name, current_provider_name
-            ));
-            return Ok(());
+            return self
+                .pick_and_switch_model(
+                    &current_provider_name,
+                    &current_model_config,
+                    &current_model_name,
+                )
+                .await;
         }
 
         let model_name = model.unwrap_or_default().trim();
@@ -862,6 +864,180 @@ impl CliSession {
         output::goose_mode_message(&format!(
             "Session model switched from '{}' to '{}' for provider '{}'",
             current_model_name, model_name, current_provider_name
+        ));
+        Ok(())
+    }
+
+    /// Bare `/model` (no argument): present one searchable menu of models across
+    /// every configured provider (local LM Studio, NVIDIA, etc.) and switch the
+    /// live session to the chosen provider + model.
+    async fn pick_and_switch_model(
+        &self,
+        current_provider_name: &str,
+        current_model_config: &goose::model::ModelConfig,
+        current_model_name: &str,
+    ) -> Result<()> {
+        use std::time::Duration;
+
+        let _ = cliclack::log::info(format!(
+            "Current model: '{current_model_name}' (provider '{current_provider_name}'). Gathering models from your configured providers…"
+        ));
+
+        let all = goose::providers::providers().await;
+        let mut entries: Vec<(String, String, String)> = Vec::new();
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut skipped: Vec<String> = Vec::new();
+
+        for (meta, _ptype) in &all {
+            let include =
+                meta.name.as_str() == current_provider_name || provider_is_configured(meta);
+            if !include || !seen.insert(meta.name.clone()) {
+                continue;
+            }
+
+            let seed = if meta.default_model.trim().is_empty() {
+                "placeholder".to_string()
+            } else {
+                meta.default_model.clone()
+            };
+            let model_config = match goose::model::ModelConfig::new(&seed) {
+                Ok(c) => c.with_canonical_limits(&meta.name),
+                Err(_) => continue,
+            };
+            let temp_provider =
+                match goose::providers::create(&meta.name, model_config, Vec::new()).await {
+                    Ok(p) => p,
+                    Err(_) => {
+                        skipped.push(meta.display_name.clone());
+                        continue;
+                    }
+                };
+
+            match tokio::time::timeout(
+                Duration::from_secs(15),
+                temp_provider.fetch_supported_models(),
+            )
+            .await
+            {
+                Ok(Ok(models)) if !models.is_empty() => {
+                    for m in models {
+                        let mut label = format!("{}  ▸  {}", meta.display_name, m);
+                        if meta.name.as_str() == current_provider_name
+                            && m.as_str() == current_model_name
+                        {
+                            label.push_str("  (current)");
+                        }
+                        entries.push((label, meta.name.clone(), m));
+                    }
+                }
+                Ok(Ok(_)) | Ok(Err(_)) | Err(_) => {
+                    skipped.push(meta.display_name.clone());
+                }
+            }
+        }
+
+        if !skipped.is_empty() {
+            let _ = cliclack::log::info(format!(
+                "Skipped {} provider(s) not available here: {}",
+                skipped.len(),
+                skipped.join(", ")
+            ));
+        }
+
+        if entries.is_empty() {
+            output::render_error(
+                "No models available from any configured provider. Check that LM Studio is running or that provider keys are set.",
+            );
+            return Ok(());
+        }
+
+        entries.sort_by(|a, b| {
+            let a_current = a.1.as_str() == current_provider_name;
+            let b_current = b.1.as_str() == current_provider_name;
+            b_current
+                .cmp(&a_current)
+                .then_with(|| a.0.to_lowercase().cmp(&b.0.to_lowercase()))
+        });
+
+        let labels: Vec<String> = entries.iter().map(|(l, _, _)| l.clone()).collect();
+        let chosen_label: String = if labels.len() > 12 {
+            crate::commands::configure::interactive_model_search(&labels)?
+        } else {
+            let items: Vec<(String, String, &str)> =
+                labels.iter().map(|l| (l.clone(), l.clone(), "")).collect();
+            cliclack::select("Select a model:")
+                .items(&items)
+                .interact()?
+        };
+
+        let (_, chosen_provider, chosen_model) =
+            match entries.into_iter().find(|(l, _, _)| l == &chosen_label) {
+                Some(e) => e,
+                None => return Ok(()),
+            };
+
+        if chosen_provider.as_str() == current_provider_name
+            && chosen_model.as_str() == current_model_name
+        {
+            output::goose_mode_message(&format!("Session already using model '{chosen_model}'"));
+            return Ok(());
+        }
+
+        let new_model_config =
+            build_switched_model_config(&chosen_provider, &chosen_model, current_model_config)?;
+        let extensions = self.agent.get_extension_configs().await;
+        let probe_provider = goose::providers::create(
+            &chosen_provider,
+            new_model_config.clone(),
+            extensions.clone(),
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to create provider: {e}"))?;
+
+        // Probe the model before committing the switch: some providers list
+        // models their account can't actually run (e.g. NVIDIA returns 404
+        // "function not found"), and a dead/stuck endpoint shouldn't silently
+        // become the session model.
+        let _ = cliclack::log::info(format!("Checking '{chosen_model}' responds…"));
+        let probe_config = probe_provider.get_model_config();
+        let probe_msg = [Message::user().with_text("ok")];
+        match tokio::time::timeout(
+            Duration::from_secs(30),
+            probe_provider.complete(&probe_config, "model-check", "", &probe_msg, &[]),
+        )
+        .await
+        {
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => {
+                output::render_error(&format!(
+                    "'{chosen_model}' isn't usable on '{chosen_provider}' — {e}. Keeping '{current_model_name}'."
+                ));
+                return Ok(());
+            }
+            Err(_) => {
+                output::render_error(&format!(
+                    "'{chosen_model}' didn't respond within 30s. Keeping '{current_model_name}'."
+                ));
+                return Ok(());
+            }
+        }
+
+        // The probe can consume one-time per-provider state: an ACP provider
+        // (claude-acp/codex-acp) treats its first prompt as its handoff-context
+        // opportunity, so installing the probed instance would drop the existing
+        // conversation history on the user's first real prompt. Drop the probe
+        // and install a fresh instance.
+        drop(probe_provider);
+        let new_provider = goose::providers::create(&chosen_provider, new_model_config, extensions)
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to create provider: {e}"))?;
+        self.agent
+            .update_provider(new_provider, &self.session_id)
+            .await?;
+        let mode = self.agent.goose_mode().await;
+        self.agent.update_goose_mode(mode, &self.session_id).await?;
+        output::goose_mode_message(&format!(
+            "Session model switched to '{chosen_model}' (provider '{chosen_provider}')"
         ));
         Ok(())
     }
@@ -2174,6 +2350,33 @@ fn format_elapsed_time(duration: std::time::Duration) -> String {
     }
 }
 
+/// Whether a provider should appear in the `/model` menu — i.e. it is actually
+/// usable, not merely declarable. Every required key must resolve (a real value
+/// or a built-in default), and if the provider authenticates with a secret
+/// (API key, bearer token) at least one such secret must hold a real value. A
+/// built-in default — e.g. Bedrock's `AWS_REGION` — is configuration, not a
+/// credential, so it never marks a secret-bearing provider configured on its
+/// own. Local no-auth providers (LM Studio, Ollama) declare no secret keys and
+/// stay always available.
+fn provider_is_configured(meta: &goose::providers::base::ProviderMetadata) -> bool {
+    let config = Config::global();
+    let has_value = |k: &goose::providers::base::ConfigKey| {
+        std::env::var(&k.name).is_ok() || config.get(&k.name, k.secret).is_ok()
+    };
+
+    let all_required_resolvable = meta
+        .config_keys
+        .iter()
+        .filter(|k| k.required)
+        .all(|k| has_value(k) || k.default.is_some());
+    if !all_required_resolvable {
+        return false;
+    }
+
+    let secret_keys: Vec<_> = meta.config_keys.iter().filter(|k| k.secret).collect();
+    secret_keys.is_empty() || secret_keys.iter().any(|k| has_value(k))
+}
+
 fn build_switched_model_config(
     provider_name: &str,
     model_name: &str,
@@ -2198,6 +2401,81 @@ mod tests {
     use std::collections::HashMap;
     use std::time::Duration;
     use test_case::test_case;
+
+    #[test]
+    fn test_provider_is_configured_default_is_not_a_credential() {
+        use goose::providers::base::{ConfigKey, ProviderMetadata};
+
+        // Mirrors Bedrock: a required non-secret key satisfied only by its
+        // built-in default, plus an unset secret credential. The default alone
+        // must not mark the provider configured.
+        let bedrock_like = ProviderMetadata::new(
+            "test_bedrock_like",
+            "Test Bedrock-like",
+            "",
+            "model-x",
+            vec!["model-x"],
+            "",
+            vec![
+                ConfigKey::new(
+                    "GOOSE_TEST_REGION_UNSET",
+                    true,
+                    false,
+                    Some("us-east-1"),
+                    true,
+                ),
+                ConfigKey::new("GOOSE_TEST_BEARER_UNSET", false, true, None, true),
+            ],
+        );
+        assert!(
+            !provider_is_configured(&bedrock_like),
+            "a default-only region must not mark a secret-bearing provider configured"
+        );
+
+        // Local no-auth provider: no secret keys, so defaults are enough.
+        let local_like = ProviderMetadata::new(
+            "test_local_like",
+            "Test Local",
+            "",
+            "model-y",
+            vec!["model-y"],
+            "",
+            vec![ConfigKey::new(
+                "GOOSE_TEST_HOST_UNSET",
+                true,
+                false,
+                Some("http://localhost:1234"),
+                true,
+            )],
+        );
+        assert!(
+            provider_is_configured(&local_like),
+            "a no-secret local provider should remain available via defaults"
+        );
+
+        // Real secret value present: configured.
+        std::env::set_var("GOOSE_TEST_APIKEY_SET", "real-key");
+        let cloud_like = ProviderMetadata::new(
+            "test_cloud_like",
+            "Test Cloud",
+            "",
+            "model-z",
+            vec!["model-z"],
+            "",
+            vec![ConfigKey::new(
+                "GOOSE_TEST_APIKEY_SET",
+                true,
+                true,
+                None,
+                true,
+            )],
+        );
+        assert!(
+            provider_is_configured(&cloud_like),
+            "a provider with a real secret value should be configured"
+        );
+        std::env::remove_var("GOOSE_TEST_APIKEY_SET");
+    }
 
     #[test]
     fn test_format_elapsed_time_under_60_seconds() {

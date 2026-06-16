@@ -1317,6 +1317,18 @@ pub fn display_session_info(
     // ASCII art goose with session info on the right
     println!();
     println!(
+        "  {}",
+        style(format!(
+            "⚙  LOCAL DEBUG BUILD  #{}  ·  {} ({})  ·  {}",
+            env!("GOOSE_BUILD_NUMBER"),
+            env!("GOOSE_BUILD_SHA"),
+            env!("GOOSE_BUILD_BRANCH"),
+            env!("GOOSE_BUILD_TIME"),
+        ))
+        .magenta()
+        .bold(),
+    );
+    println!(
         "  {}  {} {} {} {} {}",
         style("  __( O)>").white(),
         style("●").green(),

@@ -4,12 +4,180 @@
 /**
  * Add an extension to an active session.
  */
-export type AddExtensionRequest_unstable = {
+export type AddSessionExtensionRequest_unstable = {
     sessionId: string;
+    extension: GooseExtension;
+};
+
+export type GooseExtension = {
+    name: string;
+    description?: string | null;
+    display_name?: string | null;
+    timeout?: number | null;
+    bundled?: boolean | null;
+    type: 'builtin';
+} | {
+    name: string;
+    description?: string | null;
+    display_name?: string | null;
+    bundled?: boolean | null;
+    type: 'platform';
+} | {
+    server: McpServer;
+    envKeys?: Array<string>;
+    description?: string | null;
+    timeout?: number | null;
+    socket?: string | null;
+    bundled?: boolean | null;
+    type: 'mcp';
+};
+
+/**
+ * Configuration for connecting to an MCP (Model Context Protocol) server.
+ *
+ * MCP servers provide tools and context that the agent can use when
+ * processing prompts.
+ *
+ * See protocol docs: [MCP Servers](https://agentclientprotocol.com/protocol/session-setup#mcp-servers)
+ */
+export type McpServer = McpServerHttp | McpServerSse | McpServerStdio;
+
+/**
+ * An HTTP header to set when making requests to the MCP server.
+ */
+export type HttpHeader = {
     /**
-     * Extension configuration (see ExtensionConfig variants: Stdio, StreamableHttp, Builtin, Platform).
+     * The name of the HTTP header.
      */
-    config?: unknown;
+    name: string;
+    /**
+     * The value to set for the HTTP header.
+     */
+    value: string;
+    /**
+     * The _meta property is reserved by ACP to allow clients and agents to attach additional
+     * metadata to their interactions. Implementations MUST NOT make assumptions about values at
+     * these keys.
+     *
+     * See protocol docs: [Extensibility](https://agentclientprotocol.com/protocol/extensibility)
+     */
+    _meta?: {
+        [key: string]: unknown;
+    } | null;
+};
+
+/**
+ * HTTP transport configuration for MCP.
+ */
+export type McpServerHttp = {
+    /**
+     * Human-readable name identifying this MCP server.
+     */
+    name: string;
+    /**
+     * URL to the MCP server.
+     */
+    url: string;
+    /**
+     * HTTP headers to set when making requests to the MCP server.
+     */
+    headers: Array<HttpHeader>;
+    /**
+     * The _meta property is reserved by ACP to allow clients and agents to attach additional
+     * metadata to their interactions. Implementations MUST NOT make assumptions about values at
+     * these keys.
+     *
+     * See protocol docs: [Extensibility](https://agentclientprotocol.com/protocol/extensibility)
+     */
+    _meta?: {
+        [key: string]: unknown;
+    } | null;
+    type: 'http';
+};
+
+/**
+ * SSE transport configuration for MCP.
+ */
+export type McpServerSse = {
+    /**
+     * Human-readable name identifying this MCP server.
+     */
+    name: string;
+    /**
+     * URL to the MCP server.
+     */
+    url: string;
+    /**
+     * HTTP headers to set when making requests to the MCP server.
+     */
+    headers: Array<HttpHeader>;
+    /**
+     * The _meta property is reserved by ACP to allow clients and agents to attach additional
+     * metadata to their interactions. Implementations MUST NOT make assumptions about values at
+     * these keys.
+     *
+     * See protocol docs: [Extensibility](https://agentclientprotocol.com/protocol/extensibility)
+     */
+    _meta?: {
+        [key: string]: unknown;
+    } | null;
+    type: 'sse';
+};
+
+/**
+ * Stdio transport configuration for MCP.
+ */
+export type McpServerStdio = {
+    /**
+     * Human-readable name identifying this MCP server.
+     */
+    name: string;
+    /**
+     * Path to the MCP server executable.
+     */
+    command: string;
+    /**
+     * Command-line arguments to pass to the MCP server.
+     */
+    args: Array<string>;
+    /**
+     * Environment variables to set when launching the MCP server.
+     */
+    env: Array<EnvVariable>;
+    /**
+     * The _meta property is reserved by ACP to allow clients and agents to attach additional
+     * metadata to their interactions. Implementations MUST NOT make assumptions about values at
+     * these keys.
+     *
+     * See protocol docs: [Extensibility](https://agentclientprotocol.com/protocol/extensibility)
+     */
+    _meta?: {
+        [key: string]: unknown;
+    } | null;
+};
+
+/**
+ * An environment variable to set when launching an MCP server.
+ */
+export type EnvVariable = {
+    /**
+     * The name of the environment variable.
+     */
+    name: string;
+    /**
+     * The value to set for the environment variable.
+     */
+    value: string;
+    /**
+     * The _meta property is reserved by ACP to allow clients and agents to attach additional
+     * metadata to their interactions. Implementations MUST NOT make assumptions about values at
+     * these keys.
+     *
+     * See protocol docs: [Extensibility](https://agentclientprotocol.com/protocol/extensibility)
+     */
+    _meta?: {
+        [key: string]: unknown;
+    } | null;
 };
 
 /**
@@ -22,7 +190,7 @@ export type EmptyResponse = {
 /**
  * Remove an extension from an active session.
  */
-export type RemoveExtensionRequest_unstable = {
+export type RemoveSessionExtensionRequest_unstable = {
     sessionId: string;
     name: string;
 };
@@ -349,177 +517,6 @@ export type GooseExtensionEntry = {
     configKey?: string | null;
 };
 
-export type GooseExtension = {
-    name: string;
-    description?: string | null;
-    display_name?: string | null;
-    timeout?: number | null;
-    bundled?: boolean | null;
-    type: 'builtin';
-} | {
-    name: string;
-    description?: string | null;
-    display_name?: string | null;
-    bundled?: boolean | null;
-    type: 'platform';
-} | {
-    server: McpServer;
-    envKeys?: Array<string>;
-    description?: string | null;
-    timeout?: number | null;
-    socket?: string | null;
-    bundled?: boolean | null;
-    type: 'mcp';
-};
-
-/**
- * Configuration for connecting to an MCP (Model Context Protocol) server.
- *
- * MCP servers provide tools and context that the agent can use when
- * processing prompts.
- *
- * See protocol docs: [MCP Servers](https://agentclientprotocol.com/protocol/session-setup#mcp-servers)
- */
-export type McpServer = McpServerHttp | McpServerSse | McpServerStdio;
-
-/**
- * An HTTP header to set when making requests to the MCP server.
- */
-export type HttpHeader = {
-    /**
-     * The name of the HTTP header.
-     */
-    name: string;
-    /**
-     * The value to set for the HTTP header.
-     */
-    value: string;
-    /**
-     * The _meta property is reserved by ACP to allow clients and agents to attach additional
-     * metadata to their interactions. Implementations MUST NOT make assumptions about values at
-     * these keys.
-     *
-     * See protocol docs: [Extensibility](https://agentclientprotocol.com/protocol/extensibility)
-     */
-    _meta?: {
-        [key: string]: unknown;
-    } | null;
-};
-
-/**
- * HTTP transport configuration for MCP.
- */
-export type McpServerHttp = {
-    /**
-     * Human-readable name identifying this MCP server.
-     */
-    name: string;
-    /**
-     * URL to the MCP server.
-     */
-    url: string;
-    /**
-     * HTTP headers to set when making requests to the MCP server.
-     */
-    headers: Array<HttpHeader>;
-    /**
-     * The _meta property is reserved by ACP to allow clients and agents to attach additional
-     * metadata to their interactions. Implementations MUST NOT make assumptions about values at
-     * these keys.
-     *
-     * See protocol docs: [Extensibility](https://agentclientprotocol.com/protocol/extensibility)
-     */
-    _meta?: {
-        [key: string]: unknown;
-    } | null;
-    type: 'http';
-};
-
-/**
- * SSE transport configuration for MCP.
- */
-export type McpServerSse = {
-    /**
-     * Human-readable name identifying this MCP server.
-     */
-    name: string;
-    /**
-     * URL to the MCP server.
-     */
-    url: string;
-    /**
-     * HTTP headers to set when making requests to the MCP server.
-     */
-    headers: Array<HttpHeader>;
-    /**
-     * The _meta property is reserved by ACP to allow clients and agents to attach additional
-     * metadata to their interactions. Implementations MUST NOT make assumptions about values at
-     * these keys.
-     *
-     * See protocol docs: [Extensibility](https://agentclientprotocol.com/protocol/extensibility)
-     */
-    _meta?: {
-        [key: string]: unknown;
-    } | null;
-    type: 'sse';
-};
-
-/**
- * Stdio transport configuration for MCP.
- */
-export type McpServerStdio = {
-    /**
-     * Human-readable name identifying this MCP server.
-     */
-    name: string;
-    /**
-     * Path to the MCP server executable.
-     */
-    command: string;
-    /**
-     * Command-line arguments to pass to the MCP server.
-     */
-    args: Array<string>;
-    /**
-     * Environment variables to set when launching the MCP server.
-     */
-    env: Array<EnvVariable>;
-    /**
-     * The _meta property is reserved by ACP to allow clients and agents to attach additional
-     * metadata to their interactions. Implementations MUST NOT make assumptions about values at
-     * these keys.
-     *
-     * See protocol docs: [Extensibility](https://agentclientprotocol.com/protocol/extensibility)
-     */
-    _meta?: {
-        [key: string]: unknown;
-    } | null;
-};
-
-/**
- * An environment variable to set when launching an MCP server.
- */
-export type EnvVariable = {
-    /**
-     * The name of the environment variable.
-     */
-    name: string;
-    /**
-     * The value to set for the environment variable.
-     */
-    value: string;
-    /**
-     * The _meta property is reserved by ACP to allow clients and agents to attach additional
-     * metadata to their interactions. Implementations MUST NOT make assumptions about values at
-     * these keys.
-     *
-     * See protocol docs: [Extensibility](https://agentclientprotocol.com/protocol/extensibility)
-     */
-    _meta?: {
-        [key: string]: unknown;
-    } | null;
-};
-
 /**
  * List Goose-owned extension definitions available to configure or enable.
  */
@@ -559,7 +556,7 @@ export type GetSessionExtensionsRequest_unstable = {
 };
 
 export type GetSessionExtensionsResponse_unstable = {
-    extensions: Array<unknown>;
+    extensions: Array<GooseExtension>;
 };
 
 /**
@@ -1198,12 +1195,11 @@ export type SessionInfo = {
 export type SessionId = string;
 
 /**
- * Submit a response for a pending MCP elicitation in an active session.
+ * Truncate a session conversation from the given message timestamp onward.
  */
-export type ElicitationRespondRequest_unstable = {
+export type TruncateSessionConversationRequest_unstable = {
     sessionId: string;
-    elicitationId: string;
-    userData?: unknown;
+    truncateFrom: number;
 };
 
 /**
@@ -1571,9 +1567,7 @@ export type GooseSessionUpdate = ({
     sessionUpdate: 'usage_update';
 } & SessionUsageUpdate) | ({
     sessionUpdate: 'status_message';
-} & StatusMessageUpdate) | ({
-    sessionUpdate: 'interaction_update';
-} & InteractionUpdate);
+} & StatusMessageUpdate);
 
 /**
  * Streaming context-window usage update for a session.
@@ -1602,25 +1596,37 @@ export type StatusMessageUpdate = {
     status: StatusMessage;
 };
 
-export type Interaction = {
-    id: string;
-    state: InteractionState;
-    message?: string | null;
-    requestedSchema?: unknown;
-    type: 'elicitation';
+export type RequestRecipeParams_unstable = {
+    sessionId: string;
+    parameters: Array<RecipeParameter>;
 };
 
-export type InteractionState = 'pending' | 'submitted';
-
-export type InteractionUpdate = {
-    interaction: Interaction;
-    _meta?: unknown;
+export type RecipeParameter = {
+    key: string;
+    input_type: RecipeParameterInputType;
+    requirement: RecipeParameterRequirement;
+    description: string;
+    default?: string | null;
+    options?: Array<string> | null;
 };
+
+export type RecipeParameterInputType = 'string' | 'number' | 'boolean' | 'date' | 'select' | 'file';
+
+export type RecipeParameterRequirement = 'required' | 'optional' | 'user_prompt';
+
+export type RecipeParamsResponse_unstable = {
+    action?: RecipeParamsAction;
+    values?: {
+        [key: string]: string;
+    };
+};
+
+export type RecipeParamsAction = 'submit' | 'cancel';
 
 export type ExtRequest = {
     id: string;
     method: string;
-    params?: AddExtensionRequest_unstable | RemoveExtensionRequest_unstable | GetToolsRequest_unstable | GooseToolCallRequest_unstable | ReadResourceRequest_unstable | UpdateWorkingDirRequest_unstable | SetSessionSystemPromptRequest_unstable | SteerSessionRequest_unstable | DeleteSessionRequest | GetConfigExtensionsRequest_unstable | GetAvailableExtensionsRequest_unstable | AddConfigExtensionRequest_unstable | RemoveConfigExtensionRequest_unstable | SetConfigExtensionEnabledRequest_unstable | GetSessionExtensionsRequest_unstable | ListProvidersRequest_unstable | ProviderSupportedModelsListRequest_unstable | ProviderCatalogListRequest_unstable | ProviderSetupCatalogListRequest_unstable | ProviderCatalogTemplateRequest_unstable | CustomProviderCreateRequest_unstable | CustomProviderReadRequest_unstable | CustomProviderUpdateRequest_unstable | CustomProviderDeleteRequest_unstable | RefreshProviderInventoryRequest_unstable | ProviderConfigReadRequest_unstable | ProviderConfigStatusRequest_unstable | ProviderConfigSaveRequest_unstable | ProviderConfigDeleteRequest_unstable | ProviderConfigAuthenticateRequest_unstable | PreferencesReadRequest_unstable | PreferencesSaveRequest_unstable | PreferencesRemoveRequest_unstable | DefaultsReadRequest_unstable | DefaultsSaveRequest_unstable | OnboardingImportScanRequest_unstable | OnboardingImportApplyRequest_unstable | ExportSessionRequest_unstable | ImportSessionRequest_unstable | GetSessionInfoRequest_unstable | ElicitationRespondRequest_unstable | UpdateSessionProjectRequest_unstable | RenameSessionRequest_unstable | ArchiveSessionRequest_unstable | UnarchiveSessionRequest_unstable | CreateSourceRequest_unstable | ListSourcesRequest_unstable | UpdateSourceRequest_unstable | DeleteSourceRequest_unstable | ExportSourceRequest_unstable | ImportSourcesRequest_unstable | DictationTranscribeRequest_unstable | DictationConfigRequest_unstable | DictationSecretSaveRequest_unstable | DictationSecretDeleteRequest_unstable | DictationModelsListRequest_unstable | DictationModelDownloadRequest_unstable | DictationModelDownloadProgressRequest_unstable | DictationModelCancelRequest_unstable | DictationModelDeleteRequest_unstable | DictationModelSelectRequest_unstable | {
+    params?: AddSessionExtensionRequest_unstable | RemoveSessionExtensionRequest_unstable | GetToolsRequest_unstable | GooseToolCallRequest_unstable | ReadResourceRequest_unstable | UpdateWorkingDirRequest_unstable | SetSessionSystemPromptRequest_unstable | SteerSessionRequest_unstable | DeleteSessionRequest | GetConfigExtensionsRequest_unstable | GetAvailableExtensionsRequest_unstable | AddConfigExtensionRequest_unstable | RemoveConfigExtensionRequest_unstable | SetConfigExtensionEnabledRequest_unstable | GetSessionExtensionsRequest_unstable | ListProvidersRequest_unstable | ProviderSupportedModelsListRequest_unstable | ProviderCatalogListRequest_unstable | ProviderSetupCatalogListRequest_unstable | ProviderCatalogTemplateRequest_unstable | CustomProviderCreateRequest_unstable | CustomProviderReadRequest_unstable | CustomProviderUpdateRequest_unstable | CustomProviderDeleteRequest_unstable | RefreshProviderInventoryRequest_unstable | ProviderConfigReadRequest_unstable | ProviderConfigStatusRequest_unstable | ProviderConfigSaveRequest_unstable | ProviderConfigDeleteRequest_unstable | ProviderConfigAuthenticateRequest_unstable | PreferencesReadRequest_unstable | PreferencesSaveRequest_unstable | PreferencesRemoveRequest_unstable | DefaultsReadRequest_unstable | DefaultsSaveRequest_unstable | OnboardingImportScanRequest_unstable | OnboardingImportApplyRequest_unstable | ExportSessionRequest_unstable | ImportSessionRequest_unstable | GetSessionInfoRequest_unstable | TruncateSessionConversationRequest_unstable | UpdateSessionProjectRequest_unstable | RenameSessionRequest_unstable | ArchiveSessionRequest_unstable | UnarchiveSessionRequest_unstable | CreateSourceRequest_unstable | ListSourcesRequest_unstable | UpdateSourceRequest_unstable | DeleteSourceRequest_unstable | ExportSourceRequest_unstable | ImportSourcesRequest_unstable | DictationTranscribeRequest_unstable | DictationConfigRequest_unstable | DictationSecretSaveRequest_unstable | DictationSecretDeleteRequest_unstable | DictationModelsListRequest_unstable | DictationModelDownloadRequest_unstable | DictationModelDownloadProgressRequest_unstable | DictationModelCancelRequest_unstable | DictationModelDeleteRequest_unstable | DictationModelSelectRequest_unstable | {
         [key: string]: unknown;
     } | null;
 };
@@ -1642,4 +1648,24 @@ export type ExtNotification = {
     params?: GooseSessionNotification_unstable | {
         [key: string]: unknown;
     } | null;
+};
+
+export type ExtAgentRequest = {
+    id: string;
+    method: string;
+    params?: RequestRecipeParams_unstable | {
+        [key: string]: unknown;
+    } | null;
+};
+
+export type ExtAgentResponse = {
+    id: string;
+    result?: RecipeParamsResponse_unstable | unknown;
+} | {
+    error: {
+        code: number;
+        message: string;
+        data?: unknown;
+    };
+    id: string;
 };

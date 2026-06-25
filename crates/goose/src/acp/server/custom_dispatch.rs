@@ -11,20 +11,20 @@ impl GooseAcpAgent {
         self.handle_custom_request(method, params).await
     }
 
-    #[custom_method(AddExtensionRequest)]
-    async fn dispatch_add_extension(
+    #[custom_method(AddSessionExtensionRequest)]
+    async fn dispatch_add_session_extension(
         &self,
-        req: AddExtensionRequest,
+        req: AddSessionExtensionRequest,
     ) -> Result<EmptyResponse, agent_client_protocol::Error> {
-        self.on_add_extension(req).await
+        self.on_add_session_extension(req).await
     }
 
-    #[custom_method(RemoveExtensionRequest)]
-    async fn dispatch_remove_extension(
+    #[custom_method(RemoveSessionExtensionRequest)]
+    async fn dispatch_remove_session_extension(
         &self,
-        req: RemoveExtensionRequest,
+        req: RemoveSessionExtensionRequest,
     ) -> Result<EmptyResponse, agent_client_protocol::Error> {
-        self.on_remove_extension(req).await
+        self.on_remove_session_extension(req).await
     }
 
     #[custom_method(GetToolsRequest)]
@@ -329,13 +329,12 @@ impl GooseAcpAgent {
         self.on_get_session_info(req).await
     }
 
-    #[custom_method(ElicitationRespondRequest)]
-    async fn dispatch_elicitation_respond(
+    #[custom_method(TruncateSessionConversationRequest)]
+    async fn dispatch_truncate_session_conversation(
         &self,
-        _req: ElicitationRespondRequest,
+        req: TruncateSessionConversationRequest,
     ) -> Result<EmptyResponse, agent_client_protocol::Error> {
-        Err(agent_client_protocol::Error::invalid_params()
-            .data("_goose/unstable/elicitation/respond must be handled by the connection-scoped dispatcher"))
+        self.on_truncate_session_conversation(req).await
     }
 
     #[custom_method(UpdateSessionProjectRequest)]

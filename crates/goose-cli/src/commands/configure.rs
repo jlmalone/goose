@@ -19,13 +19,13 @@ use goose::config::{
     configure_tetrate, Config, ConfigError, ExperimentManager, ExtensionEntry, GooseMode,
     PermissionManager,
 };
-use goose::model::ModelConfig;
 #[cfg(feature = "telemetry")]
 use goose::posthog::{get_telemetry_choice, TELEMETRY_ENABLED_KEY};
 use goose::providers::base::ConfigKey;
 use goose::providers::provider_test::test_provider_configuration;
 use goose::providers::{create, providers, retry_operation, RetryConfig};
 use goose::session::SessionType;
+use goose_providers::thinking::ThinkingEffort;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::io::IsTerminal;
@@ -339,7 +339,7 @@ async fn handle_oauth_configuration(provider_name: &str, key_name: &str) -> anyh
     ));
 
     // Create a temporary provider instance to handle OAuth
-    let temp_model = ModelConfig::new("temp")?.with_canonical_limits(provider_name);
+    let temp_model = goose::model_config::model_config_from_user_config(provider_name, "temp")?;
     match create(provider_name, temp_model, Vec::new()).await {
         Ok(provider) => match provider.configure_oauth().await {
             Ok(_) => {
@@ -365,83 +365,50 @@ async fn handle_oauth_configuration(provider_name: &str, key_name: &str) -> anyh
     }
 }
 
-pub(crate) fn interactive_model_search(models: &[String]) -> anyhow::Result<String> {
-    const MAX_VISIBLE: usize = 30;
-    let mut query = String::new();
+const UNLISTED_MODEL_KEY: &str = "__unlisted__";
 
-    loop {
-        let _ = cliclack::clear_screen();
+/// Searchable model menu. Shows the list immediately so it can be navigated with
+/// the arrow keys and selected without typing, with cliclack's inline filter
+/// (type to fuzzy-match) and a scrolling viewport so a long catalog stays usable.
+/// Shared by the per-provider configure flow and the cross-provider bare-`/model`
+/// picker (which passes `provider_meta: None`, so there is no "unlisted" entry).
+/// Esc cancels via `io::ErrorKind::Interrupted`, which callers catch to return
+/// to their prompt rather than aborting.
+pub(crate) fn interactive_model_search(
+    models: &[String],
+    provider_meta: Option<&goose::providers::base::ProviderMetadata>,
+) -> anyhow::Result<String> {
+    const MAX_VISIBLE: usize = 12;
 
-        let _ = cliclack::log::info(format!(
-            "🔍 {} models available. Type to filter.",
-            models.len()
+    if models.is_empty() && provider_meta.is_none() {
+        anyhow::bail!("No models to choose from");
+    }
+
+    let mut items: Vec<(String, String, &str)> =
+        models.iter().map(|m| (m.clone(), m.clone(), "")).collect();
+    if provider_meta.is_some() {
+        items.push((
+            UNLISTED_MODEL_KEY.to_string(),
+            "Enter a model not listed…".to_string(),
+            "",
         ));
+    }
 
-        let input: String = cliclack::input("Filtering models, press Enter to search")
-            .placeholder("e.g., gpt, sonnet, llama, qwen")
-            .default_input(&query)
-            .interact::<String>()?;
-        query = input.trim().to_string();
+    let selection = cliclack::select(format!(
+        "Select a model ({} available, type to filter):",
+        models.len()
+    ))
+    .items(&items)
+    .filter_mode()
+    .max_rows(MAX_VISIBLE)
+    .interact()?;
 
-        let filtered: Vec<String> = if query.is_empty() {
-            models.to_vec()
-        } else {
-            let q = query.to_lowercase();
-            models
-                .iter()
-                .filter(|m| m.to_lowercase().contains(&q))
-                .cloned()
-                .collect()
-        };
-
-        if filtered.is_empty() {
-            let _ = cliclack::log::warning("No matching models. Try a different search.");
-            continue;
-        }
-
-        let mut items: Vec<(String, String, &str)> = filtered
-            .iter()
-            .take(MAX_VISIBLE)
-            .map(|m| (m.clone(), m.clone(), ""))
-            .collect();
-
-        if filtered.len() > MAX_VISIBLE {
-            items.insert(
-                0,
-                (
-                    "__refine__".to_string(),
-                    format!(
-                        "Refine search to see more (showing {} of {} results)",
-                        MAX_VISIBLE,
-                        filtered.len()
-                    ),
-                    "Too many matches",
-                ),
-            );
-        } else {
-            items.insert(
-                0,
-                (
-                    "__new_search__".to_string(),
-                    "Start a new search...".to_string(),
-                    "Enter a different search term",
-                ),
-            );
-        }
-
-        let selection = cliclack::select("Select a model:")
-            .items(&items)
-            .interact()?;
-
-        if selection == "__refine__" {
-            continue;
-        } else if selection == "__new_search__" {
-            query.clear();
-            continue;
-        } else {
-            return Ok(selection);
+    if selection == UNLISTED_MODEL_KEY {
+        if let Some(meta) = provider_meta {
+            return prompt_unlisted_model(meta);
         }
     }
+    Ok(selection)
 }
 
 fn select_model_from_list(
@@ -449,7 +416,6 @@ fn select_model_from_list(
     provider_meta: &goose::providers::base::ProviderMetadata,
 ) -> anyhow::Result<String> {
     const MAX_MODELS: usize = 10;
-    const UNLISTED_MODEL_KEY: &str = "__unlisted__";
 
     // Smart model selection:
     // If we have more than MAX_MODELS models, show the recommended models with additional search option.
@@ -488,14 +454,14 @@ fn select_model_from_list(
                 .interact()?;
 
             if selection == "search_all" {
-                Ok(interactive_model_search(models)?)
+                interactive_model_search(models, Some(provider_meta))
             } else if selection == UNLISTED_MODEL_KEY {
                 prompt_unlisted_model(provider_meta)
             } else {
                 Ok(selection)
             }
         } else {
-            Ok(interactive_model_search(models)?)
+            interactive_model_search(models, Some(provider_meta))
         }
     } else {
         let mut model_items: Vec<(String, String, &str)> =
@@ -736,8 +702,10 @@ pub async fn configure_provider_dialog() -> anyhow::Result<bool> {
 
     let spin = spinner();
     spin.start("Attempting to fetch supported models...");
-    let temp_model_config =
-        ModelConfig::new(&provider_meta.default_model)?.with_canonical_limits(provider_name);
+    let temp_model_config = goose::model_config::model_config_from_user_config(
+        provider_name,
+        &provider_meta.default_model,
+    )?;
     let temp_provider = create(provider_name, temp_model_config, Vec::new()).await?;
     let models_res = retry_operation(&RetryConfig::default(), || async {
         temp_provider.fetch_recommended_models().await
@@ -765,20 +733,22 @@ pub async fn configure_provider_dialog() -> anyhow::Result<bool> {
     {
         let supports_thinking = match temp_provider.fetch_model_info(&model).await {
             Ok(model_info) => model_info.reasoning,
-            Err(_) => goose::model::ModelConfig::new(&model)
+            Err(_) => goose_providers::model::ModelConfig::new(&model)
                 .map(|c| c.is_reasoning_model())
                 .unwrap_or(false),
         };
 
         if supports_thinking {
-            let effort: &str = cliclack::select("Select thinking effort:")
+            let effort: ThinkingEffort = cliclack::select("Select thinking effort:")
                 .item("off", "Off - No extended thinking", "")
                 .item("low", "Low - Better latency, lighter reasoning", "")
                 .item("medium", "Medium - Moderate thinking", "")
                 .item("high", "High - Deep reasoning", "")
                 .item("max", "Max - No constraints on thinking depth", "")
                 .initial_value("off")
-                .interact()?;
+                .interact()?
+                .parse()
+                .map_err(|_| anyhow::anyhow!("invalid thinking effort"))?;
             config.set_goose_thinking_effort(effort)?;
         }
     }
@@ -1080,6 +1050,7 @@ fn configure_stdio_extension() -> anyhow::Result<()> {
             env_keys,
             description,
             timeout: Some(timeout),
+            cwd: None,
             bundled: None,
             available_tools: Vec::new(),
         },
@@ -1551,7 +1522,7 @@ pub async fn configure_tool_permissions_dialog() -> anyhow::Result<()> {
     let model: String = config
         .get_goose_model()
         .expect("No model configured. Please set model first");
-    let model_config = ModelConfig::new(&model)?.with_canonical_limits(&provider_name);
+    let model_config = goose::model_config::model_config_from_user_config(&provider_name, &model)?;
 
     let agent = Agent::new();
 
@@ -1771,14 +1742,15 @@ pub async fn handle_openrouter_auth() -> anyhow::Result<()> {
     // Test configuration - get the model that was configured
     println!("\nTesting configuration...");
     let configured_model: String = config.get_goose_model()?;
-    let model_config = match goose::model::ModelConfig::new(&configured_model) {
-        Ok(config) => config.with_canonical_limits("openrouter"),
-        Err(e) => {
-            eprintln!("⚠️  Invalid model configuration: {}", e);
-            eprintln!("Your settings have been saved. Please check your model configuration.");
-            return Ok(());
-        }
-    };
+    let model_config =
+        match goose::model_config::model_config_from_user_config("openrouter", &configured_model) {
+            Ok(config) => config,
+            Err(e) => {
+                eprintln!("⚠️  Invalid model configuration: {}", e);
+                eprintln!("Your settings have been saved. Please check your model configuration.");
+                return Ok(());
+            }
+        };
 
     match create("openrouter", model_config, Vec::new()).await {
         Ok(provider) => {
@@ -1852,14 +1824,15 @@ pub async fn handle_tetrate_auth() -> anyhow::Result<()> {
     // Test configuration
     println!("\nTesting configuration...");
     let configured_model: String = config.get_goose_model()?;
-    let model_config = match goose::model::ModelConfig::new(&configured_model) {
-        Ok(config) => config.with_canonical_limits("tetrate"),
-        Err(e) => {
-            eprintln!("⚠️  Invalid model configuration: {}", e);
-            eprintln!("Your settings have been saved. Please check your model configuration.");
-            return Ok(());
-        }
-    };
+    let model_config =
+        match goose::model_config::model_config_from_user_config("tetrate", &configured_model) {
+            Ok(config) => config,
+            Err(e) => {
+                eprintln!("⚠️  Invalid model configuration: {}", e);
+                eprintln!("Your settings have been saved. Please check your model configuration.");
+                return Ok(());
+            }
+        };
 
     match create("tetrate", model_config, Vec::new()).await {
         Ok(provider) => {

@@ -13,6 +13,7 @@ use crate::session::task_execution_display::{
     format_task_execution_notification, TASK_EXECUTION_NOTIFICATION_TYPE,
 };
 use goose::conversation::Conversation;
+use std::env;
 use std::io::Write;
 use std::str::FromStr;
 use tokio::signal::ctrl_c;
@@ -27,6 +28,7 @@ use goose::permission::permission_confirmation::PrincipalType;
 use goose::permission::Permission;
 use goose::permission::PermissionConfirmation;
 use goose::providers::base::Provider;
+use goose::providers::base::ProviderUsage;
 use goose::utils::safe_truncate;
 
 use anyhow::{Context, Result};
@@ -55,6 +57,8 @@ use std::time::Instant;
 use tokio;
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
+
+const GOOSE_PLANNER_CONTEXT_LIMIT: &str = "GOOSE_PLANNER_CONTEXT_LIMIT";
 
 #[derive(Serialize, Deserialize, Debug)]
 struct JsonOutput {
@@ -172,6 +176,7 @@ pub struct CliSession {
     edit_mode: Option<EditMode>,
     retry_config: Option<RetryConfig>,
     output_format: String,
+    stats: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -250,6 +255,7 @@ impl CliSession {
         edit_mode: Option<EditMode>,
         retry_config: Option<RetryConfig>,
         output_format: String,
+        stats: bool,
     ) -> Self {
         let messages = agent
             .config
@@ -271,6 +277,7 @@ impl CliSession {
             edit_mode,
             retry_config,
             output_format,
+            stats,
         }
     }
 
@@ -312,6 +319,7 @@ impl CliSession {
             env_keys: Vec::new(),
             description: goose::config::DEFAULT_EXTENSION_DESCRIPTION.to_string(),
             timeout: Some(goose::config::DEFAULT_EXTENSION_TIMEOUT),
+            cwd: None,
             bundled: None,
             available_tools: Vec::new(),
         })
@@ -808,6 +816,26 @@ impl CliSession {
         let current_model_config = provider.get_model_config();
         let current_model_name = current_model_config.model_name.clone();
 
+        // Session model switching — the bare `/model` picker as well as
+        // `/model <name>` — is unsupported when the current provider keeps the
+        // authoritative conversation state in a subprocess: switching away would
+        // continue the next provider from only Goose's partial transcript and
+        // lose the hidden CLI/ACP context. Guard before the picker opens.
+        if current_provider_name.ends_with("-acp") {
+            output::render_error(
+                "Session model switching is not supported for ACP providers in the CLI.",
+            );
+            return Ok(());
+        }
+
+        if provider.manages_own_context() {
+            output::render_error(&format!(
+                "Session model switching is not supported for provider '{}' because it manages its own conversation context.",
+                current_provider_name
+            ));
+            return Ok(());
+        }
+
         if model.is_none() {
             return self
                 .pick_and_switch_model(
@@ -824,26 +852,14 @@ impl CliSession {
             return Ok(());
         }
 
-        if current_provider_name.ends_with("-acp") {
-            output::render_error(
-                "Session model switching is not supported for ACP providers in the CLI.",
-            );
-            return Ok(());
-        }
-
-        if provider.manages_own_context() {
-            output::render_error(&format!(
-                "Session model switching is not supported for provider '{}' because it manages its own conversation context.",
-                current_provider_name
-            ));
-            return Ok(());
-        }
-
         let new_model_config =
             build_switched_model_config(&current_provider_name, model_name, &current_model_config)?;
 
+        let configured_effort = Config::global().get_goose_thinking_effort();
+        let new_effort = new_model_config.thinking_effort().or(configured_effort);
+        let current_effort = current_model_config.thinking_effort().or(configured_effort);
         if new_model_config.model_name == current_model_config.model_name
-            && new_model_config.thinking_effort() == current_model_config.thinking_effort()
+            && new_effort == current_effort
         {
             output::goose_mode_message(&format!(
                 "Session already using model '{}' for provider '{}'",
@@ -877,7 +893,7 @@ impl CliSession {
     async fn pick_and_switch_model(
         &self,
         current_provider_name: &str,
-        current_model_config: &goose::model::ModelConfig,
+        current_model_config: &goose_providers::model::ModelConfig,
         current_model_name: &str,
     ) -> Result<()> {
         use std::time::Duration;
@@ -891,9 +907,9 @@ impl CliSession {
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
         let mut skipped: Vec<String> = Vec::new();
 
-        for (meta, _ptype) in &all {
-            let include =
-                meta.name.as_str() == current_provider_name || provider_is_configured(meta);
+        for (meta, ptype) in &all {
+            let include = meta.name.as_str() == current_provider_name
+                || goose::providers::check_provider_configured(meta, *ptype);
             if !include || !seen.insert(meta.name.clone()) {
                 continue;
             }
@@ -903,25 +919,25 @@ impl CliSession {
             } else {
                 meta.default_model.clone()
             };
-            let model_config = match goose::model::ModelConfig::new(&seed) {
+            let model_config = match goose_providers::model::ModelConfig::new(&seed) {
                 Ok(c) => c.with_canonical_limits(&meta.name),
                 Err(_) => continue,
             };
-            let temp_provider =
-                match goose::providers::create(&meta.name, model_config, Vec::new()).await {
-                    Ok(p) => p,
-                    Err(_) => {
-                        skipped.push(meta.display_name.clone());
-                        continue;
-                    }
-                };
+            // Bound construction and listing under a single timeout. An ACP
+            // provider's create() blocks on the adapter's initialize/newSession
+            // handshake, so a hung adapter would otherwise stall the picker here,
+            // before a timeout wrapped around fetch_supported_models() alone could
+            // fire. A provider that errors, times out, or lists nothing is skipped.
+            let provider_name = meta.name.clone();
+            let listed = tokio::time::timeout(Duration::from_secs(15), async move {
+                let temp_provider =
+                    goose::providers::create(&provider_name, model_config, Vec::new()).await?;
+                let models = temp_provider.fetch_supported_models().await?;
+                Ok::<Vec<String>, anyhow::Error>(models)
+            })
+            .await;
 
-            match tokio::time::timeout(
-                Duration::from_secs(15),
-                temp_provider.fetch_supported_models(),
-            )
-            .await
-            {
+            match listed {
                 Ok(Ok(models)) if !models.is_empty() => {
                     for m in models {
                         let mut label = format!("{}  ▸  {}", meta.display_name, m);
@@ -963,14 +979,18 @@ impl CliSession {
         });
 
         let labels: Vec<String> = entries.iter().map(|(l, _, _)| l.clone()).collect();
-        let chosen_label: String = if labels.len() > 12 {
-            crate::commands::configure::interactive_model_search(&labels)?
-        } else {
-            let items: Vec<(String, String, &str)> =
-                labels.iter().map(|l| (l.clone(), l.clone(), "")).collect();
-            cliclack::select("Select a model:")
-                .items(&items)
-                .interact()?
+        let chosen_label = match crate::commands::configure::interactive_model_search(&labels, None)
+        {
+            Ok(label) => label,
+            // Esc / Ctrl-C in the picker: cancel the switch and return to the
+            // session prompt rather than bubbling up and tearing down the TUI.
+            Err(e) if is_prompt_cancel(&e) => {
+                output::goose_mode_message(&format!(
+                    "Keeping current model '{current_model_name}'"
+                ));
+                return Ok(());
+            }
+            Err(e) => return Err(e),
         };
 
         let (_, chosen_provider, chosen_model) =
@@ -989,51 +1009,45 @@ impl CliSession {
         let new_model_config =
             build_switched_model_config(&chosen_provider, &chosen_model, current_model_config)?;
         let extensions = self.agent.get_extension_configs().await;
-        let probe_provider = goose::providers::create(
-            &chosen_provider,
-            new_model_config.clone(),
-            extensions.clone(),
-        )
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to create provider: {e}"))?;
+        let new_provider = goose::providers::create(&chosen_provider, new_model_config, extensions)
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to create provider: {e}"))?;
 
         // Probe the model before committing the switch: some providers list
         // models their account can't actually run (e.g. NVIDIA returns 404
         // "function not found"), and a dead/stuck endpoint shouldn't silently
-        // become the session model.
-        let _ = cliclack::log::info(format!("Checking '{chosen_model}' responds…"));
-        let probe_config = probe_provider.get_model_config();
-        let probe_msg = [Message::user().with_text("ok")];
-        match tokio::time::timeout(
-            Duration::from_secs(30),
-            probe_provider.complete(&probe_config, "model-check", "", &probe_msg, &[]),
-        )
-        .await
-        {
-            Ok(Ok(_)) => {}
-            Ok(Err(e)) => {
-                output::render_error(&format!(
-                    "'{chosen_model}' isn't usable on '{chosen_provider}' — {e}. Keeping '{current_model_name}'."
-                ));
-                return Ok(());
-            }
-            Err(_) => {
-                output::render_error(&format!(
-                    "'{chosen_model}' didn't respond within 30s. Keeping '{current_model_name}'."
-                ));
-                return Ok(());
+        // become the session model. Skip providers that manage their own context
+        // (ACP / Claude Code / Gemini CLI): they keep conversation state in a
+        // subprocess, so a synthetic probe would either consume their one-time
+        // handoff context or, if it hangs, wedge the cancellation path while the
+        // client loop is joined on drop — and they don't have the dead-catalog
+        // failure mode the probe guards against.
+        if !chosen_provider.ends_with("-acp") && !new_provider.manages_own_context() {
+            let _ = cliclack::log::info(format!("Checking '{chosen_model}' responds…"));
+            let probe_config = new_provider.get_model_config();
+            let probe_msg = [Message::user().with_text("ok")];
+            match tokio::time::timeout(
+                Duration::from_secs(30),
+                new_provider.complete(&probe_config, "model-check", "", &probe_msg, &[]),
+            )
+            .await
+            {
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) => {
+                    output::render_error(&format!(
+                        "'{chosen_model}' isn't usable on '{chosen_provider}' — {e}. Keeping '{current_model_name}'."
+                    ));
+                    return Ok(());
+                }
+                Err(_) => {
+                    output::render_error(&format!(
+                        "'{chosen_model}' didn't respond within 30s. Keeping '{current_model_name}'."
+                    ));
+                    return Ok(());
+                }
             }
         }
 
-        // The probe can consume one-time per-provider state: an ACP provider
-        // (claude-acp/codex-acp) treats its first prompt as its handoff-context
-        // opportunity, so installing the probed instance would drop the existing
-        // conversation history on the user's first real prompt. Drop the probe
-        // and install a fresh instance.
-        drop(probe_provider);
-        let new_provider = goose::providers::create(&chosen_provider, new_model_config, extensions)
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to create provider: {e}"))?;
         self.agent
             .update_provider(new_provider, &self.session_id)
             .await?;
@@ -1077,9 +1091,11 @@ impl CliSession {
             .config
             .session_manager
             .update(&self.session_id)
-            .total_tokens(Some(0))
-            .input_tokens(Some(0))
-            .output_tokens(Some(0))
+            .usage(goose_providers::conversation::token_usage::Usage::new(
+                Some(0),
+                Some(0),
+                Some(0),
+            ))
             .apply()
             .await
         {
@@ -1355,6 +1371,9 @@ impl CliSession {
         let mut markdown_buffer = streaming_buffer::MarkdownBuffer::new();
         let mut prompted_credits_urls: HashSet<String> = HashSet::new();
         let mut thinking_header_shown = false;
+        let run_started = Instant::now();
+        let mut first_token_at: Option<Instant> = None;
+        let mut last_usage: Option<ProviderUsage> = None;
 
         use futures::StreamExt;
         loop {
@@ -1362,6 +1381,9 @@ impl CliSession {
                 result = stream.next() => {
                     match result {
                         Some(Ok(AgentEvent::Message(message))) => {
+                            if first_token_at.is_none() && message_has_text(&message) {
+                                first_token_at = Some(Instant::now());
+                            }
                             if let Some((id, security_prompt)) = find_tool_confirmation(&message) {
                                 let permission = if interactive {
                                     prompt_tool_confirmation(&security_prompt)?
@@ -1485,6 +1507,9 @@ impl CliSession {
                                 }
                             }
                         }
+                        Some(Ok(AgentEvent::Usage(usage))) => {
+                            last_usage = Some(usage);
+                        }
                         Some(Ok(AgentEvent::McpNotification((extension_id, notification)))) => {
                             handle_mcp_notification(
                                 &extension_id,
@@ -1541,9 +1566,18 @@ impl CliSession {
                 .await
             {
                 Ok(session) => JsonMetadata {
-                    total_tokens: session.accumulated_total_tokens.or(session.total_tokens),
-                    input_tokens: session.accumulated_input_tokens.or(session.input_tokens),
-                    output_tokens: session.accumulated_output_tokens.or(session.output_tokens),
+                    total_tokens: session
+                        .accumulated_usage
+                        .total_tokens
+                        .or(session.usage.total_tokens),
+                    input_tokens: session
+                        .accumulated_usage
+                        .input_tokens
+                        .or(session.usage.input_tokens),
+                    output_tokens: session
+                        .accumulated_usage
+                        .output_tokens
+                        .or(session.usage.output_tokens),
                     status: "completed".to_string(),
                 },
                 Err(_) => JsonMetadata {
@@ -1568,9 +1602,9 @@ impl CliSession {
                 .ok();
             let (total_tokens, input_tokens, output_tokens) = match session {
                 Some(s) => (
-                    s.accumulated_total_tokens.or(s.total_tokens),
-                    s.accumulated_input_tokens.or(s.input_tokens),
-                    s.accumulated_output_tokens.or(s.output_tokens),
+                    s.accumulated_usage.total_tokens.or(s.usage.total_tokens),
+                    s.accumulated_usage.input_tokens.or(s.usage.input_tokens),
+                    s.accumulated_usage.output_tokens.or(s.usage.output_tokens),
                 ),
                 None => (None, None, None),
             };
@@ -1581,6 +1615,9 @@ impl CliSession {
             });
         } else {
             println!();
+            if self.stats {
+                print_run_stats(run_started, first_token_at, last_usage.as_ref());
+            }
         }
 
         Ok(())
@@ -1735,7 +1772,7 @@ impl CliSession {
 
     pub async fn get_total_token_usage(&self) -> Result<Option<i32>> {
         let metadata = self.get_session().await?;
-        Ok(metadata.accumulated_total_tokens)
+        Ok(metadata.accumulated_usage.total_tokens)
     }
 
     /// Print a one-shot status readout: model, provider, GOOSE_MODE, token usage, context %
@@ -1756,7 +1793,7 @@ impl CliSession {
             .get_session()
             .await
             .ok()
-            .and_then(|s| s.accumulated_total_tokens)
+            .and_then(|s| s.accumulated_usage.total_tokens)
             .unwrap_or(0) as usize;
 
         let context_pct = if context_limit > 0 {
@@ -1795,18 +1832,15 @@ impl CliSession {
 
         match self.get_session().await {
             Ok(metadata) => {
-                let total_tokens = metadata.total_tokens.unwrap_or(0) as usize;
+                let total_tokens = metadata.usage.total_tokens.unwrap_or(0) as usize;
 
                 output::display_context_usage(total_tokens, context_limit);
 
                 if show_cost {
-                    let input_tokens = metadata.input_tokens.unwrap_or(0) as usize;
-                    let output_tokens = metadata.output_tokens.unwrap_or(0) as usize;
                     output::display_cost_usage(
                         &provider_name,
                         &model_config.model_name,
-                        input_tokens,
-                        output_tokens,
+                        &metadata.usage,
                     );
                 }
             }
@@ -1937,6 +1971,61 @@ impl CliSession {
 
     fn push_message(&mut self, message: Message) {
         self.messages.push(message);
+    }
+}
+
+fn message_has_text(message: &Message) -> bool {
+    message.content.iter().any(
+        |content| matches!(content, MessageContent::Text(text) if !text.text.trim().is_empty()),
+    )
+}
+
+fn print_run_stats(
+    run_started: Instant,
+    first_token_at: Option<Instant>,
+    usage: Option<&ProviderUsage>,
+) {
+    let elapsed = run_started.elapsed();
+    let output_tokens = usage
+        .and_then(|usage| usage.usage.output_tokens)
+        .and_then(|tokens| usize::try_from(tokens).ok())
+        .or_else(|| usage.and_then(|usage| usage.stats.as_ref()?.output_tokens));
+    let tokens_per_second = output_tokens.map(|tokens| {
+        if elapsed.as_secs_f64() > 0.0 {
+            tokens as f64 / elapsed.as_secs_f64()
+        } else {
+            0.0
+        }
+    });
+
+    eprintln!("\nStats:");
+    match first_token_at {
+        Some(first) => eprintln!(
+            "  Time to first token: {:.2}s",
+            first.duration_since(run_started).as_secs_f64()
+        ),
+        None => eprintln!("  Time to first token: unavailable"),
+    }
+    match tokens_per_second {
+        Some(rate) => eprintln!("  Tokens/sec: {:.2}", rate),
+        None => eprintln!("  Tokens/sec: unavailable"),
+    }
+    if let Some(tokens) = output_tokens {
+        eprintln!("  Output tokens: {tokens}");
+    }
+
+    if let Some(draft) = usage
+        .and_then(|usage| usage.stats.as_ref())
+        .and_then(|stats| stats.draft.as_ref())
+    {
+        eprintln!("  Draft accept rate: {:.1}%", draft.accept_rate * 100.0);
+        eprintln!(
+            "  Draft tokens: {} accepted: {} target verified: {} rounds: {}",
+            draft.draft_tokens, draft.accepted_tokens, draft.target_tokens, draft.rounds
+        );
+        if let Some(model) = &draft.model {
+            eprintln!("  Draft model: {model}");
+        }
     }
 }
 
@@ -2347,7 +2436,6 @@ fn handle_agent_error(e: &anyhow::Error, is_stream_json_mode: bool) {
 }
 
 async fn get_reasoner() -> Result<Arc<dyn Provider>, anyhow::Error> {
-    use goose::model::ModelConfig;
     use goose::providers::create;
 
     let config = Config::global();
@@ -2372,8 +2460,19 @@ async fn get_reasoner() -> Result<Arc<dyn Provider>, anyhow::Error> {
             .expect("No model configured. Run 'goose configure' first")
     };
 
+    let planner_context_limit = match env::var(GOOSE_PLANNER_CONTEXT_LIMIT)
+        .ok()
+        .map(|v| v.parse::<usize>())
+    {
+        Some(Ok(n)) if n >= 4096 => Some(n),
+        Some(Ok(_)) => anyhow::bail!("{} must be at least 4096", GOOSE_PLANNER_CONTEXT_LIMIT),
+        Some(Err(e)) => anyhow::bail!("{}: {}", GOOSE_PLANNER_CONTEXT_LIMIT, e),
+        None => None,
+    };
+
     let model_config =
-        ModelConfig::new_with_context_env(model, &provider, Some("GOOSE_PLANNER_CONTEXT_LIMIT"))?;
+        goose::model_config::model_config_from_user_config(&provider, model.as_str())?
+            .with_context_limit(planner_context_limit);
     let extensions = goose::config::extensions::get_enabled_extensions_with_config(config);
     let reasoner = create(&provider, model_config, extensions).await?;
 
@@ -2393,42 +2492,22 @@ fn format_elapsed_time(duration: std::time::Duration) -> String {
     }
 }
 
-/// Whether a provider should appear in the `/model` menu — i.e. it is actually
-/// usable, not merely declarable. Every required key must resolve (a real value
-/// or a built-in default), and if the provider authenticates with a secret
-/// (API key, bearer token) at least one such secret must hold a real value. A
-/// built-in default — e.g. Bedrock's `AWS_REGION` — is configuration, not a
-/// credential, so it never marks a secret-bearing provider configured on its
-/// own. Local no-auth providers (LM Studio, Ollama) declare no secret keys and
-/// stay always available.
-fn provider_is_configured(meta: &goose::providers::base::ProviderMetadata) -> bool {
-    let config = Config::global();
-    let has_value = |k: &goose::providers::base::ConfigKey| {
-        std::env::var(&k.name).is_ok() || config.get(&k.name, k.secret).is_ok()
-    };
-
-    let all_required_resolvable = meta
-        .config_keys
-        .iter()
-        .filter(|k| k.required)
-        .all(|k| has_value(k) || k.default.is_some());
-    if !all_required_resolvable {
-        return false;
-    }
-
-    let secret_keys: Vec<_> = meta.config_keys.iter().filter(|k| k.secret).collect();
-    secret_keys.is_empty() || secret_keys.iter().any(|k| has_value(k))
+/// Whether a prompt error is a user cancellation (Esc / Ctrl-C), which cliclack
+/// reports as `io::ErrorKind::Interrupted`. Lets interactive flows treat a
+/// cancel as "go back" rather than bubbling it up as a fatal session error.
+fn is_prompt_cancel(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<std::io::Error>()
+        .is_some_and(|e| e.kind() == std::io::ErrorKind::Interrupted)
 }
 
 fn build_switched_model_config(
     provider_name: &str,
     model_name: &str,
-    current_model_config: &goose::model::ModelConfig,
-) -> Result<goose::model::ModelConfig> {
-    goose::model::ModelConfig::new(model_name)
+    current_model_config: &goose_providers::model::ModelConfig,
+) -> Result<goose_providers::model::ModelConfig> {
+    goose::model_config::model_config_from_user_config(provider_name, model_name)
         .map(|config| {
             config
-                .with_canonical_limits(provider_name)
                 .with_temperature(current_model_config.temperature)
                 .with_toolshim(current_model_config.toolshim)
                 .with_toolshim_model(current_model_config.toolshim_model.clone())
@@ -2444,81 +2523,6 @@ mod tests {
     use std::collections::HashMap;
     use std::time::Duration;
     use test_case::test_case;
-
-    #[test]
-    fn test_provider_is_configured_default_is_not_a_credential() {
-        use goose::providers::base::{ConfigKey, ProviderMetadata};
-
-        // Mirrors Bedrock: a required non-secret key satisfied only by its
-        // built-in default, plus an unset secret credential. The default alone
-        // must not mark the provider configured.
-        let bedrock_like = ProviderMetadata::new(
-            "test_bedrock_like",
-            "Test Bedrock-like",
-            "",
-            "model-x",
-            vec!["model-x"],
-            "",
-            vec![
-                ConfigKey::new(
-                    "GOOSE_TEST_REGION_UNSET",
-                    true,
-                    false,
-                    Some("us-east-1"),
-                    true,
-                ),
-                ConfigKey::new("GOOSE_TEST_BEARER_UNSET", false, true, None, true),
-            ],
-        );
-        assert!(
-            !provider_is_configured(&bedrock_like),
-            "a default-only region must not mark a secret-bearing provider configured"
-        );
-
-        // Local no-auth provider: no secret keys, so defaults are enough.
-        let local_like = ProviderMetadata::new(
-            "test_local_like",
-            "Test Local",
-            "",
-            "model-y",
-            vec!["model-y"],
-            "",
-            vec![ConfigKey::new(
-                "GOOSE_TEST_HOST_UNSET",
-                true,
-                false,
-                Some("http://localhost:1234"),
-                true,
-            )],
-        );
-        assert!(
-            provider_is_configured(&local_like),
-            "a no-secret local provider should remain available via defaults"
-        );
-
-        // Real secret value present: configured.
-        std::env::set_var("GOOSE_TEST_APIKEY_SET", "real-key");
-        let cloud_like = ProviderMetadata::new(
-            "test_cloud_like",
-            "Test Cloud",
-            "",
-            "model-z",
-            vec!["model-z"],
-            "",
-            vec![ConfigKey::new(
-                "GOOSE_TEST_APIKEY_SET",
-                true,
-                true,
-                None,
-                true,
-            )],
-        );
-        assert!(
-            provider_is_configured(&cloud_like),
-            "a provider with a real secret value should be configured"
-        );
-        std::env::remove_var("GOOSE_TEST_APIKEY_SET");
-    }
 
     #[test]
     fn test_format_elapsed_time_under_60_seconds() {
@@ -2596,6 +2600,7 @@ mod tests {
             env_keys: vec![],
             description: goose::config::DEFAULT_EXTENSION_DESCRIPTION.to_string(),
             timeout: Some(goose::config::DEFAULT_EXTENSION_TIMEOUT),
+            cwd: None,
             bundled: None,
             available_tools: vec![],
         }
@@ -2611,6 +2616,7 @@ mod tests {
             env_keys: vec![],
             description: goose::config::DEFAULT_EXTENSION_DESCRIPTION.to_string(),
             timeout: Some(goose::config::DEFAULT_EXTENSION_TIMEOUT),
+            cwd: None,
             bundled: None,
             available_tools: vec![],
         }
@@ -2626,6 +2632,7 @@ mod tests {
             env_keys: vec![],
             description: goose::config::DEFAULT_EXTENSION_DESCRIPTION.to_string(),
             timeout: Some(goose::config::DEFAULT_EXTENSION_TIMEOUT),
+            cwd: None,
             bundled: None,
             available_tools: vec![],
         }
@@ -2650,7 +2657,7 @@ mod tests {
             ("GOOSE_TOOLSHIM_OLLAMA_MODEL", None::<&str>),
         ]);
 
-        let current_model_config = goose::model::ModelConfig {
+        let current_model_config = goose_providers::model::ModelConfig {
             model_name: "gpt-4o".to_string(),
             context_limit: Some(128_000),
             temperature: Some(0.25),
@@ -2667,7 +2674,7 @@ mod tests {
 
         let switched =
             build_switched_model_config("openai", "gpt-5.4", &current_model_config).unwrap();
-        let expected = goose::model::ModelConfig::new_or_fail("gpt-5.4")
+        let expected = goose_providers::model::ModelConfig::new_or_fail("gpt-5.4")
             .with_canonical_limits("openai")
             .with_temperature(Some(0.25))
             .with_toolshim(true)
@@ -2694,8 +2701,8 @@ mod tests {
             ("GOOSE_THINKING_EFFORT", None::<&str>),
         ]);
 
-        let current =
-            goose::model::ModelConfig::new_or_fail("gpt-5.4-high").with_canonical_limits("openai");
+        let current = goose_providers::model::ModelConfig::new_or_fail("gpt-5.4-high")
+            .with_canonical_limits("openai");
         assert_eq!(current.model_name, "gpt-5.4");
         assert_eq!(
             current.thinking_effort(),

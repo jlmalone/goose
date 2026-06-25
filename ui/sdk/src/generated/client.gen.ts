@@ -10,7 +10,7 @@ export interface ExtMethodProvider {
 import type { Client } from "@agentclientprotocol/sdk";
 import type {
   AddConfigExtensionRequest_unstable,
-  AddExtensionRequest_unstable,
+  AddSessionExtensionRequest_unstable,
   ArchiveSessionRequest_unstable,
   CreateSourceRequest_unstable,
   CreateSourceResponse_unstable,
@@ -41,7 +41,6 @@ import type {
   DictationSecretSaveRequest_unstable,
   DictationTranscribeRequest_unstable,
   DictationTranscribeResponse_unstable,
-  ElicitationRespondRequest_unstable,
   ExportSessionRequest_unstable,
   ExportSessionResponse_unstable,
   ExportSourceRequest_unstable,
@@ -93,15 +92,18 @@ import type {
   ProviderSupportedModelsListResponse_unstable,
   ReadResourceRequest_unstable,
   ReadResourceResponse_unstable,
+  RecipeParamsResponse_unstable,
   RefreshProviderInventoryRequest_unstable,
   RefreshProviderInventoryResponse_unstable,
   RemoveConfigExtensionRequest_unstable,
-  RemoveExtensionRequest_unstable,
+  RemoveSessionExtensionRequest_unstable,
   RenameSessionRequest_unstable,
+  RequestRecipeParams_unstable,
   SetConfigExtensionEnabledRequest_unstable,
   SetSessionSystemPromptRequest_unstable,
   SteerSessionRequest_unstable,
   SteerSessionResponse_unstable,
+  TruncateSessionConversationRequest_unstable,
   UnarchiveSessionRequest_unstable,
   UpdateSessionProjectRequest_unstable,
   UpdateSourceRequest_unstable,
@@ -144,6 +146,7 @@ import {
   zProviderSupportedModelsListResponse_unstable,
   zReadResourceResponse_unstable,
   zRefreshProviderInventoryResponse_unstable,
+  zRequestRecipeParams_unstable,
   zSteerSessionResponse_unstable,
   zUpdateSourceResponse_unstable,
 } from './zod.gen.js';
@@ -152,13 +155,13 @@ export class GooseExtClient {
   constructor(private conn: ExtMethodProvider) {}
 
   async sessionExtensionsAdd_unstable(
-    params: AddExtensionRequest_unstable,
+    params: AddSessionExtensionRequest_unstable,
   ): Promise<void> {
     await this.conn.extMethod("_goose/unstable/session/extensions/add", params);
   }
 
   async sessionExtensionsRemove_unstable(
-    params: RemoveExtensionRequest_unstable,
+    params: RemoveSessionExtensionRequest_unstable,
   ): Promise<void> {
     await this.conn.extMethod(
       "_goose/unstable/session/extensions/remove",
@@ -576,10 +579,13 @@ export class GooseExtClient {
     ) as GetSessionInfoResponse_unstable;
   }
 
-  async elicitationRespond_unstable(
-    params: ElicitationRespondRequest_unstable,
+  async sessionConversationTruncate_unstable(
+    params: TruncateSessionConversationRequest_unstable,
   ): Promise<void> {
-    await this.conn.extMethod("_goose/unstable/elicitation/respond", params);
+    await this.conn.extMethod(
+      "_goose/unstable/session/conversation/truncate",
+      params,
+    );
   }
 
   async sessionProjectUpdate_unstable(
@@ -778,9 +784,19 @@ export interface GooseExtNotifications {
   ) => Promise<void>;
 }
 
-export type GooseClientCallbacks = Omit<Client, "extNotification"> &
-  Partial<Pick<Client, "extNotification">> &
-  GooseExtNotifications;
+export interface GooseExtAgentRequests {
+  unstable_sessionRecipeRequestParams?: (
+    request: RequestRecipeParams_unstable,
+  ) => Promise<RecipeParamsResponse_unstable>;
+}
+
+export type GooseClientCallbacks = Omit<
+  Client,
+  "extNotification" | "extMethod"
+> &
+  Partial<Pick<Client, "extNotification" | "extMethod">> &
+  GooseExtNotifications &
+  GooseExtAgentRequests;
 
 export function installGooseExtNotificationDispatcher(
   callbacks: GooseClientCallbacks,
@@ -805,6 +821,44 @@ export function installGooseExtNotificationDispatcher(
     get(target, property) {
       if (property === "extNotification") {
         return dispatcher.extNotification;
+      }
+
+      const value = Reflect.get(target, property, target);
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  }) as Client;
+}
+
+export function installGooseExtAgentRequestDispatcher(
+  callbacks: GooseClientCallbacks,
+): Client {
+  const dispatcher: Pick<Client, "extMethod"> = {
+    extMethod: async (method, params) => {
+      switch (method) {
+        case "_goose/unstable/session/recipe/request-params": {
+          if (callbacks.unstable_sessionRecipeRequestParams) {
+            const parsed = zRequestRecipeParams_unstable.parse(
+              params,
+            ) as RequestRecipeParams_unstable;
+            return await callbacks.unstable_sessionRecipeRequestParams(parsed);
+          }
+          if (callbacks.extMethod) {
+            return await callbacks.extMethod(method, params);
+          }
+          throw new Error(`unhandled ext method: ${method}`);
+        }
+        default:
+          if (callbacks.extMethod) {
+            return await callbacks.extMethod(method, params);
+          }
+          throw new Error(`unhandled ext method: ${method}`);
+      }
+    },
+  };
+  return new Proxy(callbacks, {
+    get(target, property) {
+      if (property === "extMethod") {
+        return dispatcher.extMethod;
       }
 
       const value = Reflect.get(target, property, target);

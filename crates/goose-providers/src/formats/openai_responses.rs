@@ -596,10 +596,11 @@ pub fn create_responses_request(
         None
     };
 
+    let store = model_config.request_param::<bool>("store").unwrap_or(false);
     let mut payload = json!({
         "model": model_name,
         "input": input_items,
-        "store": false,
+        "store": store,
     });
 
     if let Some(effort) = reasoning_effort {
@@ -1200,7 +1201,6 @@ mod tests {
             max_tokens: None,
             toolshim: false,
             toolshim_model: None,
-            fast_model_config: None,
             request_params: None,
             reasoning: None,
         };
@@ -1292,7 +1292,6 @@ mod tests {
             max_tokens: None,
             toolshim: false,
             toolshim_model: None,
-            fast_model_config: None,
             request_params: None,
             reasoning: None,
         };
@@ -1336,7 +1335,6 @@ mod tests {
                 max_tokens: None,
                 toolshim: false,
                 toolshim_model: None,
-                fast_model_config: None,
                 request_params: None,
                 reasoning: None,
             };
@@ -1358,7 +1356,7 @@ mod tests {
 
     #[test]
     fn test_responses_request_with_normalized_effort_suffix() {
-        let model_config = ModelConfig::new("o3-mini-high").unwrap();
+        let model_config = ModelConfig::new("o3-mini-high");
 
         let result = create_responses_request(&model_config, "You are helpful.", &[], &[]).unwrap();
 
@@ -1377,7 +1375,6 @@ mod tests {
                 max_tokens: None,
                 toolshim: false,
                 toolshim_model: None,
-                fast_model_config: None,
                 request_params: None,
                 reasoning: None,
             };
@@ -1403,7 +1400,6 @@ mod tests {
             max_tokens: None,
             toolshim: false,
             toolshim_model: None,
-            fast_model_config: None,
             request_params: None,
             reasoning: None,
         };
@@ -1415,6 +1411,27 @@ mod tests {
             result.get("reasoning").is_none(),
             "non-reasoning models should not receive reasoning config"
         );
+    }
+
+    #[test]
+    fn test_request_params_override_store() {
+        let model_config = ModelConfig {
+            model_name: "o3".to_string(),
+            context_limit: None,
+            temperature: None,
+            max_tokens: None,
+            toolshim: false,
+            toolshim_model: None,
+            request_params: Some(std::collections::HashMap::from([(
+                "store".to_string(),
+                serde_json::json!(true),
+            )])),
+            reasoning: None,
+        };
+
+        let result = create_responses_request(&model_config, "", &[], &[]).unwrap();
+
+        assert_eq!(result["store"], true);
     }
 
     #[test]
@@ -1432,7 +1449,6 @@ mod tests {
             max_tokens: None,
             toolshim: false,
             toolshim_model: None,
-            fast_model_config: None,
             request_params: None,
             reasoning: None,
         };
@@ -1479,7 +1495,6 @@ mod tests {
             max_tokens: None,
             toolshim: false,
             toolshim_model: None,
-            fast_model_config: None,
             request_params: None,
             reasoning: None,
         };
@@ -1516,7 +1531,6 @@ mod tests {
             max_tokens: None,
             toolshim: false,
             toolshim_model: None,
-            fast_model_config: None,
             request_params: None,
             reasoning: None,
         };
@@ -1548,7 +1562,6 @@ mod tests {
             max_tokens: None,
             toolshim: false,
             toolshim_model: None,
-            fast_model_config: None,
             request_params: None,
             reasoning: None,
         };
@@ -1579,7 +1592,6 @@ mod tests {
             max_tokens: None,
             toolshim: false,
             toolshim_model: None,
-            fast_model_config: None,
             request_params: None,
             reasoning: None,
         };
@@ -1614,7 +1626,6 @@ mod tests {
             max_tokens: None,
             toolshim: false,
             toolshim_model: None,
-            fast_model_config: None,
             request_params: None,
             reasoning: None,
         };
@@ -1651,7 +1662,6 @@ mod tests {
             max_tokens: None,
             toolshim: false,
             toolshim_model: None,
-            fast_model_config: None,
             request_params: None,
             reasoning: None,
         };
@@ -1677,7 +1687,6 @@ mod tests {
             max_tokens: None,
             toolshim: false,
             toolshim_model: None,
-            fast_model_config: None,
             request_params: None,
             reasoning: None,
         };
@@ -1709,7 +1718,6 @@ mod tests {
             max_tokens: None,
             toolshim: false,
             toolshim_model: None,
-            fast_model_config: None,
             request_params: None,
             reasoning: None,
         };
@@ -1741,7 +1749,6 @@ mod tests {
             max_tokens: None,
             toolshim: false,
             toolshim_model: None,
-            fast_model_config: None,
             request_params: None,
             reasoning: None,
         };
@@ -1863,7 +1870,6 @@ mod tests {
             max_tokens: None,
             toolshim: false,
             toolshim_model: None,
-            fast_model_config: None,
             request_params: None,
             reasoning: None,
         };
@@ -1901,7 +1907,6 @@ mod tests {
             max_tokens: None,
             toolshim: false,
             toolshim_model: None,
-            fast_model_config: None,
             request_params: None,
             reasoning: None,
         };
@@ -1939,7 +1944,6 @@ mod tests {
             max_tokens: None,
             toolshim: false,
             toolshim_model: None,
-            fast_model_config: None,
             request_params: None,
             reasoning: None,
         };

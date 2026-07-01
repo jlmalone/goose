@@ -1077,7 +1077,7 @@ impl CliSession {
             let probe_msg = [Message::user().with_text("ok")];
             match tokio::time::timeout(
                 Duration::from_secs(30),
-                new_provider.complete(&new_model_config, "model-check", "", &probe_msg, &[]),
+                new_provider.complete(&new_model_config, "", &probe_msg, &[]),
             )
             .await
             {
@@ -1830,7 +1830,10 @@ impl CliSession {
     /// Print a one-shot status readout: model, provider, GOOSE_MODE, token usage, context %
     async fn handle_status(&self) -> Result<()> {
         let provider = self.agent.provider().await?;
-        let model_config = provider.get_model_config();
+        let model_config = self
+            .agent
+            .model_config_for_session(&self.session_id)
+            .await?;
         let context_limit = model_config.context_limit();
 
         let config = Config::global();

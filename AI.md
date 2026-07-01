@@ -18,7 +18,7 @@ run via the `goose_dangerously` alias) is built from **`local/debug-synthesis`**
 the integration branch that combines the local-only work (image-path
 refinements and the debug-build banner) with the in-flight PR branches
 (`feat/model-cross-provider-picker` #9658, `fix/canonical-context-limit-precedence`
-#10170).
+#10170, `feat/shell-passthrough` #10177).
 
 **Before building that binary, bring `local/debug-synthesis` up to date.** Merge
 current `origin/main` and any in-flight feature branch whose code the binary
@@ -33,7 +33,8 @@ Build process:
 git checkout local/debug-synthesis
 git merge origin/main \
   feat/model-cross-provider-picker \
-  fix/canonical-context-limit-precedence             # latest master + in-flight PRs
+  fix/canonical-context-limit-precedence \
+  feat/shell-passthrough                             # latest master + in-flight PRs
 # resolve conflicts favouring upstream for shared code; KEEP the local-only
 # work (image-path refinements, banner). Watch for clean-but-wrong merges: a
 # textually-clean merge can still break the build when upstream changes an API

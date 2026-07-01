@@ -915,31 +915,29 @@ impl CliSession {
                 continue;
             }
 
-            let seed = if meta.default_model.trim().is_empty() {
-                "placeholder".to_string()
-            } else {
-                meta.default_model.clone()
-            };
-            let model_config = match goose_providers::model::ModelConfig::new(&seed) {
-                Ok(c) => c.with_canonical_limits(&meta.name),
-                Err(_) => continue,
-            };
             // Bound construction and listing under a single timeout. An ACP
             // provider's create() blocks on the adapter's initialize/newSession
             // handshake, so a hung adapter would otherwise stall the picker here,
             // before a timeout wrapped around fetch_supported_models() alone could
             // fire. A provider that errors, times out, or lists nothing is skipped.
             let provider_name = meta.name.clone();
-            let listed = tokio::time::timeout(Duration::from_secs(15), async move {
-                let temp_provider =
-                    goose::providers::create(&provider_name, model_config, Vec::new()).await?;
-                let models = temp_provider.fetch_supported_models().await?;
-                Ok::<Vec<String>, anyhow::Error>(models)
-            })
+            // Suppress ACP model pinning while listing: an option-backed ACP
+            // provider (Copilot) would otherwise try to apply the active
+            // session's model, reject it as foreign, and drop out of the picker.
+            let listed = goose::acp::while_listing_models(tokio::time::timeout(
+                Duration::from_secs(15),
+                async move {
+                    let temp_provider =
+                        goose::providers::create(&provider_name, Vec::new()).await?;
+                    let applies_selected_model = temp_provider.applies_selected_model();
+                    let models = temp_provider.fetch_supported_models().await?;
+                    Ok::<(bool, Vec<String>), anyhow::Error>((applies_selected_model, models))
+                },
+            ))
             .await;
 
             match listed {
-                Ok(Ok(models)) if !models.is_empty() => {
+                Ok(Ok((true, models))) if !models.is_empty() => {
                     for m in models {
                         let mut label = format!("{}  ▸  {}", meta.display_name, m);
                         if meta.name.as_str() == current_provider_name
@@ -949,6 +947,22 @@ impl CliSession {
                         }
                         entries.push((label, meta.name.clone(), m));
                     }
+                }
+                // A provider that lists models but can't apply a per-model choice
+                // (an ACP wrapper with no model-config option, e.g. Claude Code)
+                // gets one entry: selecting a specific model would persist it on
+                // the goose side while the agent silently stays on its own model.
+                // Switch to the provider with the "current" sentinel instead.
+                Ok(Ok((false, models))) if !models.is_empty() => {
+                    let mut label = format!("{}  ▸  (agent's current model)", meta.display_name);
+                    if meta.name.as_str() == current_provider_name {
+                        label.push_str("  (current)");
+                    }
+                    entries.push((
+                        label,
+                        meta.name.clone(),
+                        goose::acp::ACP_CURRENT_MODEL.to_string(),
+                    ));
                 }
                 Ok(Ok(_)) | Ok(Err(_)) | Err(_) => {
                     skipped.push(meta.display_name.clone());
@@ -978,6 +992,23 @@ impl CliSession {
                 .cmp(&a_current)
                 .then_with(|| a.0.to_lowercase().cmp(&b.0.to_lowercase()))
         });
+
+        // cliclack returns only the selected label, so two entries sharing an
+        // identical label (a custom/declarative provider with the same display
+        // name and model id as another) would make the lookup below ambiguous
+        // and resolve to the wrong provider. Disambiguate any collision with the
+        // internal provider name so every label maps back to exactly one entry.
+        let mut label_counts: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
+        for (label, _, _) in &entries {
+            *label_counts.entry(label.clone()).or_insert(0) += 1;
+        }
+        for (label, provider, _) in entries.iter_mut() {
+            if label_counts.get(label.as_str()).copied().unwrap_or(0) > 1 {
+                let suffix = format!("  ({provider})");
+                label.push_str(&suffix);
+            }
+        }
 
         let labels: Vec<String> = entries.iter().map(|(l, _, _)| l.clone()).collect();
         let chosen_label = match crate::commands::configure::interactive_model_search(&labels, None)
@@ -1010,9 +1041,27 @@ impl CliSession {
         let new_model_config =
             build_switched_model_config(&chosen_provider, &chosen_model, current_model_config)?;
         let extensions = self.agent.get_extension_configs().await;
-        let new_provider = goose::providers::create(&chosen_provider, new_model_config, extensions)
+        let new_provider = goose::providers::create(&chosen_provider, extensions)
             .await
             .map_err(|e| anyhow::anyhow!("Failed to create provider: {e}"))?;
+
+        // Switching INTO a provider that manages its own context (Claude Code,
+        // Gemini CLI) would silently drop the conversation so far: it keeps no
+        // handoff path and forwards only the latest user message, so the existing
+        // transcript never reaches it. Refuse when there is history to lose,
+        // mirroring the current-provider guard in handle_model. ACP providers also
+        // report manages_own_context() == true, but they carry a first-prompt
+        // handoff that does relay the transcript, so exclude *-acp targets here and
+        // let them switch.
+        if new_provider.manages_own_context()
+            && !chosen_provider.ends_with("-acp")
+            && !self.messages.is_empty()
+        {
+            output::render_error(&format!(
+                "Can't switch to '{chosen_provider}' mid-session: it manages its own conversation context and would drop the current history. Keeping '{current_model_name}'. Start a new session to use it."
+            ));
+            return Ok(());
+        }
 
         // Probe the model before committing the switch: some providers list
         // models their account can't actually run (e.g. NVIDIA returns 404
@@ -1025,11 +1074,10 @@ impl CliSession {
         // failure mode the probe guards against.
         if !chosen_provider.ends_with("-acp") && !new_provider.manages_own_context() {
             let _ = cliclack::log::info(format!("Checking '{chosen_model}' responds…"));
-            let probe_config = new_provider.get_model_config();
             let probe_msg = [Message::user().with_text("ok")];
             match tokio::time::timeout(
                 Duration::from_secs(30),
-                new_provider.complete(&probe_config, "model-check", "", &probe_msg, &[]),
+                new_provider.complete(&new_model_config, "model-check", "", &probe_msg, &[]),
             )
             .await
             {
@@ -1050,13 +1098,19 @@ impl CliSession {
         }
 
         self.agent
-            .update_provider(new_provider, &self.session_id)
+            .update_provider(new_provider, new_model_config, &self.session_id)
             .await?;
         let mode = self.agent.goose_mode().await;
         self.agent.update_goose_mode(mode, &self.session_id).await?;
-        output::goose_mode_message(&format!(
-            "Session model switched to '{chosen_model}' (provider '{chosen_provider}')"
-        ));
+        if chosen_model == goose::acp::ACP_CURRENT_MODEL {
+            output::goose_mode_message(&format!(
+                "Session switched to '{chosen_provider}' (model managed by the agent)"
+            ));
+        } else {
+            output::goose_mode_message(&format!(
+                "Session model switched to '{chosen_model}' (provider '{chosen_provider}')"
+            ));
+        }
         Ok(())
     }
 

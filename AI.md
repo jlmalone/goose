@@ -16,8 +16,9 @@ Up one level: the "Goose" section of `~/AI.md`.
 The daily-driver binary (`/opt/homebrew/bin/goose` -> `target/release/goose`,
 run via the `goose_dangerously` alias) is built from **`local/debug-synthesis`**,
 the integration branch that combines the local-only work (image-path
-refinements, the debug-build banner, the `/status` command) with the active
-feature branches under review.
+refinements and the debug-build banner) with the in-flight PR branches
+(`feat/model-cross-provider-picker` #9658, `fix/canonical-context-limit-precedence`
+#10170).
 
 **Before building that binary, bring `local/debug-synthesis` up to date.** Merge
 current `origin/main` and any in-flight feature branch whose code the binary
@@ -30,10 +31,16 @@ Build process:
 
 ```bash
 git checkout local/debug-synthesis
-git merge origin/main feat/<active-feature-branch>   # bring in latest before building
+git merge origin/main \
+  feat/model-cross-provider-picker \
+  fix/canonical-context-limit-precedence             # latest master + in-flight PRs
 # resolve conflicts favouring upstream for shared code; KEEP the local-only
-# work (image-path refinements, banner, /status). Watch for clean-but-wrong
-# merges: renamed Session fields, duplicated help lines.
+# work (image-path refinements, banner). Watch for clean-but-wrong merges: a
+# textually-clean merge can still break the build when upstream changes an API
+# the local code calls. Seen 2026-07-01: the provider refactor dropped the
+# session_id arg from Provider::complete and removed Provider::get_model_config,
+# so the picker probe and /status compiled on the PR branches but not on
+# freshly-merged synthesis until adapted.
 cargo check -p goose-cli -p goose                    # confirm the merge compiles
 cargo build --release -p goose-cli                   # updates target/release/goose
 ```
@@ -53,4 +60,8 @@ Preserve these across every merge; they are not upstreamed:
   `crates/goose-providers/src/images.rs`.
 - **Debug-build banner** (build number + sha/branch/time) in
   `crates/goose-cli/src/session/output.rs`.
-- **`/status`** session command (model / provider / mode / token usage).
+
+`/status` (model / provider / mode / token usage) and the image-path base landed
+upstream (#9845, #9387); only the refinements and banner above stay local-only.
+When merging `origin/main`, favour upstream's `/status` over the old preserved
+WIP so the two do not drift.
